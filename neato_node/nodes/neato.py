@@ -43,6 +43,8 @@ from tf.broadcaster import TransformBroadcaster
 
 from neato_driver.neato_driver import xv11, BASE_WIDTH, MAX_SPEED
 
+x_pre = 0
+z_pre = 0
 class NeatoNode:
 
     def __init__(self):
@@ -50,13 +52,13 @@ class NeatoNode:
         rospy.init_node('neato')
 
         self.port = rospy.get_param('~port', "/dev/ttyUSB0")
-        rospy.loginfo("Using port: %s"%(self.port))
+        rospy.loginfo("speed filter enabled Using port: %s"%(self.port))
 
         self.robot = xv11(self.port)
 
         rospy.Subscriber("cmd_vel", Twist, self.cmdVelCb)
         self.scanPub = rospy.Publisher('base_scan', LaserScan, queue_size=10)
-        self.odomPub = rospy.Publisher('odom', Odometry, queue_size=10)
+        self.odomPub = rospy.Publisher('odom',Odometry, queue_size=10)
         self.odomBroadcaster = TransformBroadcaster()
 
         self.cmd_vel = [0,0] 
@@ -73,33 +75,41 @@ class NeatoNode:
         scan_link = rospy.get_param('~frame_id','base_laser_link')
         scan = LaserScan(header=rospy.Header(frame_id=scan_link)) 
         scan.angle_min = 0
-        scan.angle_max = 6.26
+        scan.angle_max = 6.28
         scan.angle_increment = 0.017437326
         scan.range_min = 0.020
-        scan.range_max = 5.0
+        scan.range_max = 8.0
         odom = Odometry(header=rospy.Header(frame_id="odom"), child_frame_id='base_link')
     
         # main loop of driver
         r = rospy.Rate(5)
-        self.robot.requestScan()
         while not rospy.is_shutdown():
             # prepare laser scan
-            scan.header.stamp = rospy.Time.now()    
-            #self.robot.requestScan()
-            scan.ranges = self.robot.getScanRanges()
+            scan.header.stamp = rospy.Time.now() - rospy.Duration(0.15)
+            self.robot.requestScan()
+            scan.ranges = self.robot.getScanRanges() # it takes 50ms from request
 
             # get motor encoder values
+            get_odom_time = rospy.Time.now()
             left, right = self.robot.getMotors()
-
+            #rospy.loginfo("left motor:%s"%(left))
+            #rospy.loginfo("right motor:%s"%(right))
             # send updated movement commands
-            self.robot.setMotors(self.cmd_vel[0], self.cmd_vel[1], max(abs(self.cmd_vel[0]),abs(self.cmd_vel[1])))
-            
-            # ask for the next scan while we finish processing stuff
-            self.robot.requestScan()
+            global x_pre
+            global z_pre
+            filter_time = 0.1
+            x_speed = self.cmd_vel[0] * ( 1 - filter_time) + filter_time * x_pre 
+            x_pre = x_speed
+            y_speed = self.cmd_vel[1] * ( 1 - filter_time) + filter_time * z_pre 
+            z_pre = y_speed            
+            #rospy.loginfo(" x_speed :%s"%(x_speed))
+            #rospy.loginfo(" y_speed :%s"%(y_speed))          
+            self.robot.setMotors(x_speed, y_speed, max(abs(x_speed),abs(y_speed)))
+            #self.robot.setMotors(self.cmd_vel[0], self.cmd_vel[1], max(abs(self.cmd_vel[0]),abs(self.cmd_vel[1])))
             
             # now update position information
-            dt = (scan.header.stamp - then).to_sec()
-            then = scan.header.stamp
+            dt = (get_odom_time - then).to_sec()
+            then = get_odom_time
 
             d_left = (left - encoders[0])/1000.0
             d_right = (right - encoders[1])/1000.0
@@ -120,7 +130,7 @@ class NeatoNode:
             quaternion.w = cos(self.th/2.0)
 
             # prepare odometry
-            odom.header.stamp = rospy.Time.now()
+            odom.header.stamp = get_odom_time
             odom.pose.pose.position.x = self.x
             odom.pose.pose.position.y = self.y
             odom.pose.pose.position.z = 0
@@ -130,7 +140,7 @@ class NeatoNode:
 
             # publish everything
             self.odomBroadcaster.sendTransform( (self.x, self.y, 0), (quaternion.x, quaternion.y, quaternion.z, quaternion.w),
-                then, "base_link", "odom" )
+                get_odom_time, "base_link", "odom" )
             self.scanPub.publish(scan)
             self.odomPub.publish(odom)
 
@@ -139,7 +149,7 @@ class NeatoNode:
 
         # shut down
         self.robot.setLDS("off")
-        self.robot.setTestMode("off") 
+        #self.robot.setTestMode("off") 
 
     def cmdVelCb(self,req):
         x = req.linear.x * 1000
